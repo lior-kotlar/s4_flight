@@ -385,7 +385,10 @@ def main():
                 disable_tqdm=DISABLE_PBARS
             )
 
-            # ---> TRACK THE WINNER AND UPDATE THE FILE <---
+            all_results_path = os.path.join(EXPERIMENT_DIR, 'all_configs_results.txt')
+            with open(all_results_path, 'a') as f:
+                f.write(f"configuration {run_idx} best loss - {run_loss:.6f}\n")
+
             if run_loss < overall_best_loss:
                 overall_best_loss = run_loss
                 overall_best_run_name = os.path.basename(current_instance_directory)
