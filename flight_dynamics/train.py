@@ -4,6 +4,7 @@ import json
 import argparse
 import itertools
 import math
+import gc
 import pickle
 from datetime import datetime
 import torch
@@ -29,11 +30,13 @@ if tuple(map(int, torch.__version__.split('.')[:2])) >= (1, 12):
 else:
     dropout_fn = nn.Dropout2d
 
-
+FLIGHT_DYNAMICS_DIR = 'flight_dynamics'  # Default working directory
+RUNS_DIRECTORY = os.path.join(FLIGHT_DYNAMICS_DIR, "runs")
+os.makedirs(RUNS_DIRECTORY, exist_ok=True)
 # ==========================================
 # 1. DIRECTORY & CONFIG MANAGEMENT
 # ==========================================
-def create_directory_structure(working_dir, experiment_name, conf_idx=None):
+def create_directory_structure(experiment_directory, experiment_name, conf_idx=None):
     # Formatted without colons to avoid filesystem errors
     timestamp = datetime.now().strftime("%Y_%m_%d_%H%M%S")
     
@@ -41,14 +44,14 @@ def create_directory_structure(working_dir, experiment_name, conf_idx=None):
         dir_name = f"{experiment_name}{conf_idx}_{timestamp}"
     else:
         dir_name = f"{experiment_name}_{timestamp}"
+
+    current_instance_dir = os.path.join(experiment_directory, dir_name)
+    checkpoint_dir = os.path.join(current_instance_dir, 'checkpoints')
     
-    run_dir = os.path.join(working_dir, "runs", dir_name)
-    checkpoint_dir = os.path.join(run_dir, 'checkpoints')
-    
-    os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(current_instance_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    return run_dir, checkpoint_dir
+    return current_instance_dir, checkpoint_dir
 
 
 # ==========================================
@@ -228,10 +231,10 @@ def evaluate(epoch, model, dataloader, device, optimizer, checkpoint_dir, is_val
 # ==========================================
 # 5. PIPELINE EXECUTION
 # ==========================================
-def run_training_pipeline(config, X_train, y_train, X_val, y_val, run_dir, checkpoint_dir, device, conf_idx=None, disable_tqdm=False):
+def run_training_pipeline(config, X_train, y_train, X_val, y_val, current_instance_dir, checkpoint_dir, device, conf_idx=None, disable_tqdm=False):
     """Encapsulates a single training run with a specific config dictionary."""
     run_label = f"Config {conf_idx}" if conf_idx else "Single Config"
-    print(f"\n[{run_label}] Output Directory: {run_dir}")
+    print(f"\n[{run_label}] Output Directory: {current_instance_dir}")
     
     # Extract Hyperparameters for this specific run
     try:
@@ -248,7 +251,7 @@ def run_training_pipeline(config, X_train, y_train, X_val, y_val, run_dir, check
         raise KeyError(f"Missing required hyperparameter in JSON config file: {e}")
 
     # Save a copy of this run's configuration
-    config_path_out = os.path.join(run_dir, 'config.json')
+    config_path_out = os.path.join(current_instance_dir, 'config.json')
     with open(config_path_out, 'w') as f:
         json.dump(config, f, indent=4)
 
@@ -256,15 +259,15 @@ def run_training_pipeline(config, X_train, y_train, X_val, y_val, run_dir, check
     feature_scaler = NormalizerFactory.create(FEATURE_NORMALIZER, global_normalizer=True)
     target_scaler = NormalizerFactory.create(TARGET_NORMALIZER, global_normalizer=True)
 
-    # ---> ADD THESE LINES TO SAVE THE SCALERS <---
-    with open(os.path.join(run_dir, 'feature_scaler.pkl'), 'wb') as f:
-        pickle.dump(feature_scaler, f)
-    with open(os.path.join(run_dir, 'target_scaler.pkl'), 'wb') as f:
-        pickle.dump(target_scaler, f)
-
     # Instantiate Datasets
     trainset = InsectFlightSeq2SeqDataset(X_train, y_train, feature_scaler=feature_scaler, target_scaler=target_scaler, is_train=True)
     valset = InsectFlightSeq2SeqDataset(X_val, y_val, feature_scaler=feature_scaler, target_scaler=target_scaler, is_train=False)
+
+    # ---> ADD THESE LINES TO SAVE THE SCALERS <---
+    with open(os.path.join(current_instance_dir, 'feature_scaler.pkl'), 'wb') as f:
+        pickle.dump(feature_scaler, f)
+    with open(os.path.join(current_instance_dir, 'target_scaler.pkl'), 'wb') as f:
+        pickle.dump(target_scaler, f)
 
     trainloader = DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, collate_fn=pad_collate)
     valloader = DataLoader(valset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, collate_fn=pad_collate)
@@ -288,6 +291,15 @@ def run_training_pipeline(config, X_train, y_train, X_val, y_val, run_dir, check
 
     print(f"[{run_label}] Completed. Best model saved to: {checkpoint_dir}")
 
+    del model
+    del optimizer
+    del trainloader
+    del valloader
+    gc.collect()
+    if device == 'cuda':
+        torch.cuda.empty_cache()
+
+    return best_val_loss
 
 def main():
     # Setup Argument Parser
@@ -305,10 +317,8 @@ def main():
         raw_config = json.load(f)
 
     # Extract non-grid parameters (Data paths and Working Directory)
-    WORKING_DIR = raw_config.pop("working_directory", "flight_dynamics")
     FEATURES_FILE = raw_config.pop("features_file", "data/features.pt")
     TARGETS_FILE = raw_config.pop("targets_file", "data/targets.pt")
-    
     TRAIN_RATIO = raw_config.pop("train_split_ratio", 0.85)
 
     # Build Configuration Grid
@@ -338,7 +348,6 @@ def main():
     torch.manual_seed(42)
     indices = torch.randperm(total_samples).tolist()
     
-    # --- YOUR FIX: Direct calculation based on the single float ---
     train_size = int(TRAIN_RATIO * total_samples)
     
     train_indices = indices[:train_size]
@@ -350,6 +359,12 @@ def main():
     y_val = [y_full[i] for i in val_indices]
     print(f"Dataset split: {len(X_train)} Train | {len(X_val)} Val")
 
+    EXPERIMENT_DIR = os.path.join(RUNS_DIRECTORY, args.name)
+    os.makedirs(EXPERIMENT_DIR, exist_ok=True)
+
+    overall_best_loss = float('inf')
+    overall_best_run_name = None
+
     # Execute all configurations
     for i, config_instance in enumerate(config_combinations, start=1):
         if num_configs > 1:
@@ -359,15 +374,49 @@ def main():
             
         # Create directory for this specific run
         run_idx = i if num_configs > 1 else None
-        run_dir, checkpoint_dir = create_directory_structure(WORKING_DIR, args.name, run_idx)
+        current_instance_directory, checkpoint_dir = create_directory_structure(EXPERIMENT_DIR, args.name, run_idx)
         
-        run_training_pipeline(
-            config_instance, 
-            X_train, y_train, X_val, y_val, 
-            run_dir, checkpoint_dir, 
-            DEVICE, conf_idx=run_idx,
-            disable_tqdm=DISABLE_PBARS
-        )
+        try:
+            run_loss = run_training_pipeline(
+                config_instance, 
+                X_train, y_train, X_val, y_val, 
+                current_instance_directory, checkpoint_dir, 
+                DEVICE, conf_idx=run_idx,
+                disable_tqdm=DISABLE_PBARS
+            )
+
+            # ---> TRACK THE WINNER AND UPDATE THE FILE <---
+            if run_loss < overall_best_loss:
+                overall_best_loss = run_loss
+                overall_best_run_name = os.path.basename(current_instance_directory)
+                
+                # Write a living document that updates during the grid search
+                live_tracker_path = os.path.join(EXPERIMENT_DIR, 'best_so_far.txt')
+                with open(live_tracker_path, 'w') as f:
+                    f.write(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"Current Best Model: {overall_best_run_name}\n")
+                    f.write(f"Current Lowest Validation MSE: {overall_best_loss:.6f}\n")
+
+        except torch.cuda.OutOfMemoryError:
+            print(f"\n[!] CUDA Out of Memory on Config {run_idx}. This hyperparameter combination is too large for the GPU. Skipping...")
+            gc.collect()
+            if DEVICE == 'cuda':
+                torch.cuda.empty_cache()
+            continue  # Move straight to the next configuration!
+            
+        except Exception as e:
+            print(f"\n[!] An unexpected error occurred on Config {run_idx}: {e}")
+            continue
+
+    if num_configs > 1 and overall_best_run_name is not None:
+        summary_path = os.path.join(EXPERIMENT_DIR, 'best_model_summary.txt')
+        with open(summary_path, 'w') as f:
+            f.write(f"Grid Search Completed on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Total configurations tested: {num_configs}\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"BEST MODEL RUN: {overall_best_run_name}\n")
+            f.write(f"LOWEST VALIDATION MSE: {overall_best_loss:.6f}\n")
+        print(f"\n==> Best model summary saved to: {summary_path}")
 
 if __name__ == '__main__':
     main()
