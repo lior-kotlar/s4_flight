@@ -5,7 +5,8 @@
 #SBATCH --mem=128g
 #SBATCH --cpus-per-task=8
 #SBATCH --time=16:00:00
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:1
+#SBATCH --exclude=catfish-[01-05]
 #SBATCH --mail-user=lior.kotlar@mail.huji.ac.il
 #SBATCH --mail-type=END,FAIL
 
