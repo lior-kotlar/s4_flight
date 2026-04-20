@@ -16,6 +16,7 @@ import torch.backends.cudnn as cudnn
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from tqdm.auto import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 from normalizer import NormalizerFactory
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -157,28 +158,36 @@ def setup_optimizer(model, lr, weight_decay, epochs):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
     return optimizer, scheduler
 
-def train_epoch(epoch, model, dataloader, optimizer, device, disable_tqdm=False):
+def train_epoch(epoch, model, dataloader, optimizer, device, disable_tqdm=False, accumulation_steps=1):
     model.train()
     train_loss = 0
     pbar = tqdm(enumerate(dataloader), total=len(dataloader), leave=False, disable=disable_tqdm)
-    
+    optimizer.zero_grad()
+
     for batch_idx, (inputs, targets, mask) in pbar:
         inputs = inputs.to(device, dtype=torch.float32)
         targets = targets.to(device, dtype=torch.float32)
         mask = mask.to(device, dtype=torch.float32)
         
-        optimizer.zero_grad()
         outputs = model(inputs)
         
         loss_unreduced = F.mse_loss(outputs, targets, reduction='none').mean(dim=-1) 
         masked_loss = loss_unreduced * mask
         loss = masked_loss.sum() / mask.sum()
+
+        loss = loss / accumulation_steps
         
         loss.backward()
-        optimizer.step()
+        if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(dataloader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad() # Reset for the next accumulation cycle
 
-        train_loss += loss.item()
+        # 3. Multiply the logged loss back up so your progress bar shows the true MSE
+        train_loss += loss.item() * accumulation_steps
         pbar.set_description(f'Train Epoch: {epoch} | Masked MSE: {train_loss/(batch_idx+1):.4f}')
+    
+    return train_loss / len(dataloader)
 
 def evaluate(epoch, model, dataloader, device, is_val=True, disable_tqdm=False):
     model.eval()
@@ -213,8 +222,7 @@ def run_training_pipeline(config, X_train, y_train, X_val, y_val, current_instan
         NUM_WORKERS = config["num_workers"]
         D_MODEL = config["d_model"]
         N_LAYERS = config["n_layers"]
-        FEATURE_NORMALIZER = config["feature_normalizer"]
-        TARGET_NORMALIZER = config["target_normalizer"]
+        ACCUMULATION_STEPS = config["accumulation_steps"]
     except KeyError as e:
         raise KeyError(f"Missing required hyperparameter in JSON config file: {e}")
 
@@ -245,6 +253,9 @@ def run_training_pipeline(config, X_train, y_train, X_val, y_val, current_instan
     trainloader = DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, collate_fn=pad_collate)
     valloader = DataLoader(valset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, collate_fn=pad_collate)
 
+    tb_dir = os.path.join(current_instance_dir, 'tensorboard')
+    writer = SummaryWriter(log_dir=tb_dir)
+
     model = S4Seq2SeqModel(d_input=12, d_output=6, d_model=D_MODEL, n_layers=N_LAYERS).to(device)
     optimizer, scheduler = setup_optimizer(model, lr=LR, weight_decay=WEIGHT_DECAY, epochs=EPOCHS)
 
@@ -267,9 +278,12 @@ def run_training_pipeline(config, X_train, y_train, X_val, y_val, current_instan
 
     print(f"[{run_label}] Starting Training Loop...")
     for epoch in range(start_epoch, EPOCHS + 1):
-        train_epoch(epoch, model, trainloader, optimizer, device, disable_tqdm=disable_tqdm)
+        avg_train_loss = train_epoch(epoch, model, trainloader, optimizer, device, disable_tqdm=disable_tqdm, accumulation_steps=ACCUMULATION_STEPS)
         val_loss = evaluate(epoch, model, valloader, device, is_val=True, disable_tqdm=disable_tqdm)
         scheduler.step()
+
+        writer.add_scalar('Loss/Train', avg_train_loss, epoch)
+        writer.add_scalar('Loss/Validation', val_loss, epoch)
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -291,9 +305,16 @@ def run_training_pipeline(config, X_train, y_train, X_val, y_val, current_instan
             
         print(f"[{run_label}] Epoch {epoch} | Val MSE: {val_loss:.4f} | Best: {best_val_loss:.4f}")
 
-    print(f"[{run_label}] Completed. Best model saved to: {checkpoint_dir}")
-
     print(f"[{run_label}] Completed. Checkpoints saved to: {checkpoint_dir}")
+    # PyTorch requires hparams to be basic data types (strings, ints, floats, bools)
+    clean_config = {k: v for k, v in config.items() if isinstance(v, (int, float, str, bool))}
+    writer.add_hparams(
+        hparam_dict=clean_config, 
+        metric_dict={'hparam_best_val_loss': best_val_loss},
+        run_name="hparams" 
+    )
+    writer.close()
+
     del model, optimizer, trainloader, valloader
     gc.collect()
     if device == 'cuda': torch.cuda.empty_cache()
